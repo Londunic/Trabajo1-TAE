@@ -1,0 +1,366 @@
+---
+title: "<center>Análisis de las instituciones educativas de los Estados Unidos</center>"
+author: "Valentina Vanegas Castaño <br> Edwar Jose Londoño Correa <br> Andres Castrillón Velasquez <br> Diego Andres Chavarria Riaño <br> Sebastian Rendon Arteaga"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message = F,warning = F)
+```
+
+```{r}
+library(pander)
+
+#install.packages("corrplot")
+library(sjmisc)
+library(dplyr)
+library(stringr)
+library(caret)
+library(kableExtra)
+library(corrplot)
+library(fdm2id)
+library(flexclust)
+```
+
+## 1- Contexto del problema
+
+En este trabajo se pretende abordar la problemática que presentan los usuarios cuando desean adquirir una educación universitaria: "¿Qué universidad escoger?", "'¿Cuál se adapta mejor a mis requerimientos?".
+
+Para esto, se hara uso de una base de datos puesta a disposición para el público del Departamento de Educación de los Estados Unidos. El nombre del dataset es "CollegeScorecard.csv", el cual fué publicado en el año 2016. Cada registro corresponde a la información de las diferentes instituciones educativas de dicho país. El dataset se compone de 7804 observaciones y 1725 variables como se observa en la Tabla 1.
+
+El objetivo de este proyecto es segmentar la información del dataset, con el fin de poder identificar que instituciones comparten cierta similitud de acuerdo a las características con las que se van a utilizar. Para lograr nuestro objetivo, utilizaremos un trabajo realizado por Delgado (2018), en el cual hacen uso de librerias y metodologías que nos sirven de base para poder crear nuestro modelo, y también se hara uso de los conceptos aplicados en el trabajo realizado por Amat (2017), sobre "Clustering y heatmaps: aprendizaje no supervisado".
+
+Con la realización de este trabajo, se espera poder ayudar a los usuarios de Estados Unidos a poder seleccionar una institución de Educación Superior para estudiar, mostrando las características de los grupos que se identifiquen.
+
+```{r}
+#Se carga el dataset
+data <- read.csv("CollegeScorecard.csv", encoding = "UTF-8")
+```
+
+```{r}
+size <- data.frame(Filas=nrow(data),Columnas = ncol(data))
+
+kable(size,caption = "Tamaño de los datos") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+```
+
+<center>**Tabla 1.** Tamaño del dataset</center>
+
+## 2- Procesamiento de los datos
+
+Para la depuración inicial de la base de datos se tomaron en cuenta las instituciones que están operando actualmente y que sean solamente presenciales. Luego seleccionamos las variables que queremos tomar en cuenta en nuestro estudio:
+
+\- Nombre de institución.
+
+\- Tipo_de_Entidad: Tipo de institución (Public, private nonprofit, private for-profit).
+
+\- Costo_Anual_Estudio: costo anual de estudio.
+
+\- Becados_Pell: porcentaje de estudiantes con beca "PELL".
+
+\- Estudiantes_Mayor_25: porcentaje de estudiantes mayores a 25 años.
+
+\- GananciaEstudiante: Ganancia de la universidad por estudiante.
+
+Luego, se procedió a revisar los valores nulos de las variables seleccionadas y se eliminaron.
+
+```{r}
+#Función para cambiar la variable control
+trans_variable_control <- function(p){
+  if (p==1){
+    valorNuevo <- "PUBLIC"
+  }else if(p==2){
+    valorNuevo <- "PRIVATE_NONPROFIT"
+  }else{
+    valorNuevo <- "PRIVATE_FOR_PROFIT"
+  }
+  return(valorNuevo)
+}
+
+
+# Depuración de los datos
+data <- subset(data, CURROPER !=0)
+data <- subset(data, DISTANCEONLY !=1)
+data <- subset(data, select = c(INSTNM,CONTROL,COSTT4_A,COSTT4_P,PCTPELL,UG25abv,TUITFTE,LATITUDE,LONGITUDE, region))
+data <- data[(!is.na(data$COSTT4_A)) | (!is.na(data$COSTT4_P)), ]
+data <- subset(data, str_detect(data$INSTNM,"niversity")|str_detect(data$INSTNM,"ollege")|str_detect(data$INSTNM,"nstitu"))
+
+data <- data[(!is.na(data$TUITFTE)),]
+data <- data[(!is.na(data$UG25abv)),]
+data <- data[(!is.na(data$PCTPELL)),]
+data <- data[(!is.na(data$COSTT4_A)),]
+data <- data[(!is.na(data$LATITUDE)),]
+data <- data[(!is.na(data$LONGITUDE)),]
+
+data <- subset(data,select = -c(COSTT4_P))
+data$CONTROL <- sapply(data$CONTROL, trans_variable_control)
+names(data) <- c('Institucion','Tipo_de_Entidad','Costo_Anual_Estudio','Becados_Pell','Estudiantes_Mayor_25','GananciaEstudiante', "Latitud", "Longitud", "Region")
+
+#Se convierte la variable Tipo_de_Entidad en tipo factor
+data$Tipo_de_Entidad <- as.factor(data$Tipo_de_Entidad)
+
+#Se eliminan los registros que no sean de Estados Unidos
+inf <- which(data$Region==9)
+data <- data[-inf,]
+
+data <- subset(data, select = -c(Region))
+```
+
+```{r}
+#apply(X = is.na(data), MARGIN = 2, FUN = sum)
+```
+
+Al realizar todo lo anterior, se obtiene la nueva dimención de los datos que se observa en la Tabla 2.
+
+```{r}
+size <- data.frame(Filas=nrow(data),Columnas = ncol(data))
+
+kable(size,caption = "Tamaño de los datos") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+```
+
+<center>**Tabla 2.** Tamaño del dataset depurado</center>
+
+## 3- Normalización de las variables
+
+Se normaliza la base de datos convirtiendo las variables categóricas en "dummies", se normalizan las variables de tipo numérica para transformarlas a escala de \[0,1\], y se elimina la variable "Institucion" para poder crear el modelo de agrupamiento.
+
+```{r}
+#Se crea una copia del dataset
+dataInicial<-data
+data <- subset(data, select = -c(Latitud, Longitud))
+
+#Se divide el dataset en variable categoricas y variables numericas
+var_cat <- sapply(data,is.factor)
+data_cat <- data[var_cat]
+data_num <- data[!var_cat]
+data_num <- subset(data_num, select = -c(Institucion))
+
+#Se crean las variables dummies
+onehotencoding <- dummyVars(~.,data = data_cat)
+data_cat_dummy <- predict(onehotencoding,data_cat)
+data_cat_dummy <- as.data.frame(data_cat_dummy)
+names(data_cat_dummy) <- c("PRIVATE_FOR_PROFIT","PRIVATE_NONPROFIT", "PUBLIC")
+
+#Normalizacion de los datos numericos
+valor_max <- apply(data_num,2,max)
+valor_min <- apply(data_num,2,min)
+data_num_norm <- scale(data_num, center = valor_min,scale = (valor_max-valor_min))
+
+#Se unen los datos
+data_modelo <-as.data.frame(cbind(data_num_norm,data_cat_dummy))
+```
+
+De esta forma se obtiene el dataset que se muestra en la Tabla 3.
+
+```{r}
+encabezado <-head(data_modelo)
+kable(encabezado,caption = "Datos normalizados y convertidos en dummies") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+```
+
+<center>**Tabla 3**. Primero registros del dataset normalizado y con las variables dummies</center>
+
+## 4- Correlación entre las variables
+
+Se analiza el grado de correlación existente entre las variables con las que se esta trabajando, esto se puede ver en la Figura 1.
+
+```{r}
+correlacion<-round(cor(data_modelo), 1)
+
+corrplot(correlacion, method="number", type="upper")
+```
+
+<center>**Figura 1**. Correlación entre las variables de estudio</center>
+
+<br>
+
+Se puede observar que la correlación mas significativa es entre las variables "Costo_Anual_Estudio" y "GananciaEstudiante" que tiene un valor de 0.80.
+
+## 5- Modelo de agrupamiento
+
+Para el proyecto, se utilizará el metodo **K-Means**. Para esto primero se utilizará el **Método del Codo** (Elbow Method) para poder identificar el número óptimo de clusters.
+
+```{r}
+#Calculo de los valores WCSS (Within Clusters Summed Squares)
+set.seed(1234)
+wcss <- vector()
+for(i in 1:20){
+  wcss[i] <- sum(kmeans(data_modelo, i)$withinss)
+}
+
+# Se grafica los resultados obtenidos
+
+ggplot() + geom_point(aes(x = 1:20, y = wcss), color = 'black') + 
+  geom_line(aes(x = 1:20, y = wcss), color = 'red') + 
+  ggtitle("Método del Codo") + 
+  xlab('Cantidad de Centroides k') + 
+  ylab('WCSS')
+```
+
+<center>**Gráfica 1**. Método del codo para identificar número de cluster óptimo</center>
+
+<br>
+
+En la Gráfica 1, se puede observar que el número óptimo de clusters es 3, dicho valor sera empleado para el parámetro del modelo de agrupamiento. En la Tabla 4, podemos observar un resumen donde se observa el valor de la medía para cada variable numérica de acuerdo a cada grupo obtenido. Por otro lado, en la Tabla 5 podemos observar la cantidad por cada tipo de institución que hay en cada grupo.
+
+```{r}
+#Se crea el modelo
+agrupamiento <- kmeans(data_modelo, centers = 4)
+```
+
+```{r}
+# Se obtiene el resumen del agrupamiento
+dataInicial$Clasificacion <- agrupamiento$cluster
+
+var_cate <- sapply(dataInicial,is.factor)
+data_cate <- dataInicial[var_cate]
+data_cate$Clasificacion <- agrupamiento$cluster
+data_nume <- dataInicial[!var_cate]
+data_nume <- subset(data_nume, select = -c(Institucion, Latitud, Longitud))
+
+kable(aggregate(.~Clasificacion, data= data_nume, mean),caption = "Resumen de la media de las variables numéricas en cada grupo") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+```
+
+<center>**Tabla 4**. Resumen de las variables numéricas para grupo</center>
+
+<br>
+
+```{r}
+conteo <- count(data_cate,data_cate$Clasificacion, data_cate$Tipo_de_Entidad)
+colnames(conteo) <- c("Clasificacion", "Tipo_de_Entidad", "Cantidad")
+
+kable(conteo,caption = "Conteo de tipo de institución por grupo") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+```
+
+<center>**Tabla 5**. Conteo de tipo de institución por grupo</center>
+
+<br>
+
+```{r}
+#Se crean los grupos de acuerdo a la clasificación obtenida
+grupo1 <- subset(dataInicial, dataInicial$Clasificacion==1)
+grupo1_inst <- grupo1$Institucion
+grupo1 <- subset(grupo1, select = -c(Institucion, Latitud, Longitud))
+
+grupo2 <- subset(dataInicial, dataInicial$Clasificacion==2)
+grupo2_inst <- grupo2$Institucion
+grupo2 <- subset(grupo2, select = -c(Institucion, Latitud, Longitud))
+
+grupo3 <- subset(dataInicial, dataInicial$Clasificacion==3)
+grupo3_inst <- grupo3$Institucion
+grupo3 <- subset(grupo3, select = -c(Institucion, Latitud, Longitud))
+
+grupo4 <- subset(dataInicial, dataInicial$Clasificacion==4)
+grupo4_inst <- grupo4$Institucion
+grupo4 <- subset(grupo4, select = -c(Institucion, Latitud, Longitud))
+```
+
+En las Tablas 6, 7, 8, 9 podemos ver un resumen mas detallado por cada grupo. En estos resumen se presentan datos estadísticos de las variables numéricas y las frecuencias de las variables categóricas.
+
+```{r}
+#Resumen del grupo 1
+kable(summary(grupo1),caption = "Resumen del grupo 1") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+
+grupo1$Institucion <- grupo1_inst
+```
+
+<center>**Tabla 6**. Datos estadísticos para las variables del grupo 1</center>
+
+<br>
+
+```{r}
+#Resumen del grupo 2
+kable(summary(grupo2),caption = "Resumen del grupo 2") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+
+grupo2$Institucion <- grupo2_inst
+```
+
+<center>**Tabla 7**. Datos estadísticos para las variables del grupo 2</center>
+
+<br>
+
+```{r}
+#Resumen del grupo 3
+kable(summary(grupo3),caption = "Resumen del grupo 3") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+
+grupo3$Institucion <- grupo3_inst
+```
+
+<center>**Tabla 8**. Datos estadísticos para las variables del grupo 3</center>
+
+<br>
+
+```{r}
+#Resumen del grupo 4
+kable(summary(grupo4),caption = "Resumen del grupo 4") %>% 
+  kable_styling(full_width = F,position = "center") %>% 
+  kable_minimal()
+
+grupo4$Institucion <- grupo4_inst
+```
+
+<center>**Tabla 9**. Datos estadísticos para las variables del grupo 4</center>
+
+<br>
+
+## 6- Análisis de los resultados
+
+-   En los grupos 1, 3 y 4 existe solo un tipo de institución. En el grupo 1 solo existen instituciones de tipo "pública", al igual que en el grupo 3 y 4. En el grupo 2 se encuentran instituciones de tipo "privado sin fines de lucro" y "privado con fines de lucro".
+
+-   El grupo 1 posee el valor promedio más bajo en la variable "**Estudiantes_Mayor_25**".
+
+-   El grupo 2 posee el valor promedio más alto en las variables "**Costo_Anual_Estudio**", "**Estudiantes_Mayor_25"** y"**GananciaEstudiante**".
+
+-   El grupo 3 posee el valor promedio más bajo en las variables "**Costo_Anual_Estudio**" y"**GananciaEstudiante**".
+
+-   El grupo 4 posee el valor promedio más alto en la variable "**Becados_Pell**".
+
+## 7- Conclusiones
+
+1.  Si un usuario aspira a una beca "PELL", debería seleccionar universidades que se encuentren en el grupo 4 o 2, ya que estos grupos poseen un porcentaje promedio alto de estudiantes con este tipo de beca.
+
+2.  Si se desea estudiar con estudiantes mayores a 25 años, se debería seleccionar instituciones que se encuentren en los grupos 2, 3 y 4, ya que estos posee un alto porcentaje promedio de estudiantes con esta característica.
+
+3.  Si un usuario desea escoger una universidad que presenten un menor costo anual promedio, debería seleccionar universidades que se encuentren en los grupos 3 o 4, los cuales en ambos todas las instituciones son de tipo pública.
+
+4.  Si desea estudiar en un instituto que presente un alto costo anual promedio y un alto porcentaje promedio de ganancias por estudiante, se debe escoger instituciones que esten en el grupo 2.
+
+## 8- Propuesta
+
+En el siguiente link podemos encontrar información relacionada a las instituciones del pais seccionadas por "Educación preescolar, básica y media", "Educación superior", "Educación para el trabajo y desarrollo humano". Dentro de cada una de estas secciones podemos encontrar una gran cantidad de datos que nos servirían para identificar o clasificar que instituciones educativas son mejores. Si nos detenemos en la sección de "Educación superior" podemos observar que hay datos sobre la cantidad de programas curriculares, estadísticas de matrícula por municipios, por departamentos, podemos ver que instituciones cuentan con acreditación, si son públicas o privadas, entre otras. A continuación podemos realizar un procedimiento similar al realizado en este documento, seleccionando las variables que se consideren relevantes para clasificar las instituciones en un escalafón particular definido por las persona que realiza el estudio.
+
+https://www.mineducacion.gov.co/portal/Ministerio/Informacion-Institucional/349303:Datos-Abiertos
+
+## 9- Links
+
+-   Para conocer la aplicación web que creamos utilizando el modelo creado, haz click, <a href='https://sebasrendon12.shinyapps.io/myapp/' target='_blank'> aquí </a> .
+
+-   Para conocer el video donde explicamos acerca del funcionamiento de la aplicación, haz click, <a href='https://youtu.be/J9ok8tUQ7Zw' target='_blank'> aquí </a> .
+
+## 10- Referencias
+
+-   Delgado, R.. (2018). Introducción a los Modelos de Agrupamiento (Clustering) en R. 2022, octubre 19, de RPubs. Sitio web: https://rpubs.com/rdelgado/399475
+
+-   Amat, J.. (2017). Clustering y heatmaps: aprendizaje no supervisado. 2022, octubre 19, de RPubs. Sitio web: https://rpubs.com/Joaquin_AR/310338
+
+```{r}
+# Para la aplicación se guarda lo siguiente
+# save(valor_max, file = "valor_max.RData")
+# save(valor_min, file = "valor_min.RData")
+# save(agrupamiento, file = "agrupamiento.RData")
+```
